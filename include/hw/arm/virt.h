@@ -157,6 +157,8 @@ struct VirtMachineClass {
     bool no_nested_smmu;
     /* HVF specific: support for kernel-irqchip=on introduced in QEMU 11.1 */
     bool hvf_no_kernel_irqchip_default;
+    /* Machines < 11.2 don't expose the RTC via an ACPI Time and Alarm Device */
+    bool no_acpi_tad;
 };
 
 struct VirtMachineState {

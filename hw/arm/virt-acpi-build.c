@@ -129,6 +129,248 @@ static void acpi_dsdt_add_flash(Aml *scope, const MemMapEntry *flash_memmap)
     aml_append(scope, dev);
 }
 
+/* ACPI Time and Alarm Device (ACPI 6.6, section 9.17) */
+#define ACPI_TAD_CAP_REAL_TIME      BIT(2)  /* _GCP: get/set real time */
+#define ACPI_TAD_TZ_UNSPECIFIED     2047
+#define ACPI_TAD_SRT_FAILED         0xFFFFFFFF
+
+/*
+ * Create named fields for the date and time members of the 16 byte buffer
+ * returned by _GRT and passed to _SRT.
+ */
+static void acpi_tad_create_rt_fields(Aml *method, Aml *buf)
+{
+    aml_append(method, aml_create_word_field(buf, aml_int(0), "YEAR"));
+    aml_append(method, aml_create_byte_field(buf, aml_int(2), "MNTH"));
+    aml_append(method, aml_create_byte_field(buf, aml_int(3), "MDAY"));
+    aml_append(method, aml_create_byte_field(buf, aml_int(4), "HOUR"));
+    aml_append(method, aml_create_byte_field(buf, aml_int(5), "MINS"));
+    aml_append(method, aml_create_byte_field(buf, aml_int(6), "SECS"));
+}
+
+/*
+ * _GRT: convert the number of seconds since 1970-01-01 00:00:00 held by the
+ * PL031 RTC into a calendar date and time, using Howard Hinnant's
+ * civil_from_days() algorithm, which works on years starting on March 1st so
+ * that leap days are always at the end of the year.
+ */
+static Aml *acpi_tad_build_grt(void)
+{
+    Aml *days = aml_local(0);   /* days since 1970-01-01, then 0000-03-01 */
+    Aml *tod = aml_local(1);    /* seconds, then minutes since midnight */
+    Aml *era = aml_local(2);    /* 400 year period */
+    Aml *doe = aml_local(3);    /* day of era [0, 146096] */
+    Aml *yoe = aml_local(4);    /* year of era [0, 399] */
+    Aml *doy = aml_local(5);    /* day of year [0, 365] */
+    Aml *mp = aml_local(6);     /* month [0, 11], starting with March */
+    Aml *year = aml_local(7);
+    Aml *method, *ifctx, *elsectx, *tmp;
+
+    /*
+     * Valid is always 1 and TimeZone is always 2047 (unspecified), as the
+     * PL031 does not keep track of the time zone. Milliseconds, Daylight and
+     * the padding are always 0.
+     */
+    uint8_t buf[16] = {
+        [7] = 1,                                /* Valid */
+        [10] = ACPI_TAD_TZ_UNSPECIFIED & 0xff,  /* TimeZone */
+        [11] = ACPI_TAD_TZ_UNSPECIFIED >> 8,
+    };
+
+    method = aml_method("_GRT", 0, AML_SERIALIZED);
+    aml_append(method, aml_name_decl("BUFF", aml_buffer(sizeof(buf), buf)));
+    acpi_tad_create_rt_fields(method, aml_name("BUFF"));
+
+    /* Divide (RTDR, 86400, Local1, Local0) */
+    aml_append(method, aml_divide(aml_name("RTDR"), aml_int(86400), tod, days));
+    /* Divide (Local1, 60, SECS, Local1) */
+    aml_append(method, aml_divide(tod, aml_int(60), aml_name("SECS"), tod));
+    /* Divide (Local1, 60, MINS, HOUR) */
+    aml_append(method, aml_divide(tod, aml_int(60), aml_name("MINS"),
+                                  aml_name("HOUR")));
+
+    /* Local0 += 719468 */
+    aml_append(method, aml_add(days, aml_int(719468), days));
+    /* Divide (Local0, 146097, Local3, Local2) */
+    aml_append(method, aml_divide(days, aml_int(146097), doe, era));
+
+    /*
+     * Local4 = (Local3 - Local3 / 1460 + Local3 / 36524 - Local3 / 146096) /
+     *          365
+     */
+    tmp = aml_subtract(doe, aml_divide(doe, aml_int(1460), NULL, NULL), NULL);
+    tmp = aml_add(tmp, aml_divide(doe, aml_int(36524), NULL, NULL), NULL);
+    tmp = aml_subtract(tmp, aml_divide(doe, aml_int(146096), NULL, NULL), NULL);
+    aml_append(method, aml_divide(tmp, aml_int(365), NULL, yoe));
+
+    /* Local5 = Local3 - (Local4 * 365 + Local4 / 4 - Local4 / 100) */
+    tmp = aml_add(aml_multiply(yoe, aml_int(365), NULL),
+                  aml_divide(yoe, aml_int(4), NULL, NULL), NULL);
+    tmp = aml_subtract(tmp, aml_divide(yoe, aml_int(100), NULL, NULL), NULL);
+    aml_append(method, aml_subtract(doe, tmp, doy));
+
+    /* Local6 = (Local5 * 5 + 2) / 153 */
+    tmp = aml_add(aml_multiply(doy, aml_int(5), NULL), aml_int(2), NULL);
+    aml_append(method, aml_divide(tmp, aml_int(153), NULL, mp));
+
+    /* MDAY = Local5 - (Local6 * 153 + 2) / 5 + 1 */
+    tmp = aml_add(aml_multiply(mp, aml_int(153), NULL), aml_int(2), NULL);
+    tmp = aml_subtract(doy, aml_divide(tmp, aml_int(5), NULL, NULL), NULL);
+    aml_append(method, aml_add(tmp, aml_int(1), aml_name("MDAY")));
+
+    /* Local7 = Local2 * 400 + Local4 */
+    tmp = aml_multiply(era, aml_int(400), NULL);
+    aml_append(method, aml_add(tmp, yoe, year));
+
+    /*
+     * If (Local6 < 10)
+     * {
+     *     MNTH = Local6 + 3
+     * }
+     * Else
+     * {
+     *     MNTH = Local6 - 9
+     *     Local7++
+     * }
+     */
+    ifctx = aml_if(aml_lless(mp, aml_int(10)));
+    aml_append(ifctx, aml_add(mp, aml_int(3), aml_name("MNTH")));
+    aml_append(method, ifctx);
+    elsectx = aml_else();
+    aml_append(elsectx, aml_subtract(mp, aml_int(9), aml_name("MNTH")));
+    aml_append(elsectx, aml_increment(year));
+    aml_append(method, elsectx);
+
+    /* YEAR = Local7 */
+    aml_append(method, aml_store(year, aml_name("YEAR")));
+    aml_append(method, aml_return(aml_name("BUFF")));
+    return method;
+}
+
+/*
+ * _SRT: convert a calendar date and time into the number of seconds since
+ * 1970-01-01 00:00:00, using the same algorithm as mktimegm(), and load it
+ * into the PL031 RTC. The TimeZone and Daylight fields are ignored, given
+ * that _GRT always reports the time zone as unspecified.
+ */
+static Aml *acpi_tad_build_srt(void)
+{
+    Aml *year = aml_local(0);   /* year, starting on March 1st */
+    Aml *month = aml_local(1);  /* month [3, 14], starting with March */
+    Aml *time = aml_local(2);   /* days, then seconds since 1970-01-01 */
+    Aml *method, *ifctx, *tmp;
+
+    method = aml_method("_SRT", 1, AML_SERIALIZED);
+    acpi_tad_create_rt_fields(method, aml_arg(0));
+
+    /*
+     * If ((YEAR < 1970) || (MNTH < 1) || (MNTH > 12) || (MDAY < 1) ||
+     *     (MDAY > 31) || (HOUR > 23) || (MINS > 59) || (SECS > 59))
+     * {
+     *     Return (0xFFFFFFFF)
+     * }
+     */
+    tmp = aml_lless(aml_name("YEAR"), aml_int(1970));
+    tmp = aml_lor(tmp, aml_lless(aml_name("MNTH"), aml_int(1)));
+    tmp = aml_lor(tmp, aml_lgreater(aml_name("MNTH"), aml_int(12)));
+    tmp = aml_lor(tmp, aml_lless(aml_name("MDAY"), aml_int(1)));
+    tmp = aml_lor(tmp, aml_lgreater(aml_name("MDAY"), aml_int(31)));
+    tmp = aml_lor(tmp, aml_lgreater(aml_name("HOUR"), aml_int(23)));
+    tmp = aml_lor(tmp, aml_lgreater(aml_name("MINS"), aml_int(59)));
+    tmp = aml_lor(tmp, aml_lgreater(aml_name("SECS"), aml_int(59)));
+    ifctx = aml_if(tmp);
+    aml_append(ifctx, aml_return(aml_int(ACPI_TAD_SRT_FAILED)));
+    aml_append(method, ifctx);
+
+    /* Local0 = YEAR */
+    aml_append(method, aml_store(aml_name("YEAR"), year));
+    /* Local1 = MNTH */
+    aml_append(method, aml_store(aml_name("MNTH"), month));
+
+    /*
+     * If (Local1 < 3)
+     * {
+     *     Local0--
+     *     Local1 += 12
+     * }
+     */
+    ifctx = aml_if(aml_lless(month, aml_int(3)));
+    aml_append(ifctx, aml_decrement(year));
+    aml_append(ifctx, aml_add(month, aml_int(12), month));
+    aml_append(method, ifctx);
+
+    /*
+     * Local2 = MDAY + (Local1 * 153 - 457) / 5 + Local0 * 365 + Local0 / 4 -
+     *          Local0 / 100 + Local0 / 400 - 719469
+     */
+    tmp = aml_subtract(aml_multiply(month, aml_int(153), NULL), aml_int(457),
+                       NULL);
+    tmp = aml_add(aml_name("MDAY"), aml_divide(tmp, aml_int(5), NULL, NULL),
+                  NULL);
+    tmp = aml_add(tmp, aml_multiply(year, aml_int(365), NULL), NULL);
+    tmp = aml_add(tmp, aml_divide(year, aml_int(4), NULL, NULL), NULL);
+    tmp = aml_subtract(tmp, aml_divide(year, aml_int(100), NULL, NULL), NULL);
+    tmp = aml_add(tmp, aml_divide(year, aml_int(400), NULL, NULL), NULL);
+    aml_append(method, aml_subtract(tmp, aml_int(719469), time));
+
+    /* Local2 = ((Local2 * 24 + HOUR) * 60 + MINS) * 60 + SECS */
+    tmp = aml_add(aml_multiply(time, aml_int(24), NULL), aml_name("HOUR"),
+                  NULL);
+    tmp = aml_add(aml_multiply(tmp, aml_int(60), NULL), aml_name("MINS"),
+                  NULL);
+    tmp = aml_multiply(tmp, aml_int(60), NULL);
+    aml_append(method, aml_add(tmp, aml_name("SECS"), time));
+
+    /*
+     * The PL031 counter is 32 bits wide, and so it cannot represent dates
+     * after 2106-02-07 06:28:15.
+     *
+     * If (Local2 > 0xFFFFFFFF)
+     * {
+     *     Return (0xFFFFFFFF)
+     * }
+     */
+    ifctx = aml_if(aml_lgreater(time, aml_int(UINT32_MAX)));
+    aml_append(ifctx, aml_return(aml_int(ACPI_TAD_SRT_FAILED)));
+    aml_append(method, ifctx);
+
+    /* RTLR = Local2 */
+    aml_append(method, aml_store(time, aml_name("RTLR")));
+    aml_append(method, aml_return(aml_int(0)));
+    return method;
+}
+
+/*
+ * Expose the get/set real time functionality of the PL031 RTC via an ACPI
+ * Time and Alarm Device. The PL031 holds the number of seconds since
+ * 1970-01-01 00:00:00 in a 32-bit counter, which can be read via the RTCDR
+ * data register and set via the RTCLR load register.
+ */
+static void acpi_dsdt_add_tad(Aml *scope, const MemMapEntry *rtc_memmap)
+{
+    Aml *dev, *field, *method;
+
+    dev = aml_device("RTC0");
+    aml_append(dev, aml_name_decl("_HID", aml_string("ACPI000E")));
+
+    aml_append(dev, aml_operation_region("RTCR", AML_SYSTEM_MEMORY,
+                                         aml_int(rtc_memmap->base),
+                                         rtc_memmap->size));
+    field = aml_field("RTCR", AML_DWORD_ACC, AML_NOLOCK, AML_WRITE_AS_ZEROS);
+    aml_append(field, aml_named_field("RTDR", 32));
+    aml_append(field, aml_reserved_field(32));
+    aml_append(field, aml_named_field("RTLR", 32));
+    aml_append(dev, field);
+
+    method = aml_method("_GCP", 0, AML_NOTSERIALIZED);
+    aml_append(method, aml_return(aml_int(ACPI_TAD_CAP_REAL_TIME)));
+    aml_append(dev, method);
+
+    aml_append(dev, acpi_tad_build_grt());
+    aml_append(dev, acpi_tad_build_srt());
+    aml_append(scope, dev);
+}
+
 static void build_acpi0017(Aml *table)
 {
     Aml *dev, *scope, *method;
@@ -1212,11 +1454,6 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
     acpi_table_begin(&table, table_data);
     dsdt = init_aml_allocator();
 
-    /* When booting the VM with UEFI, UEFI takes ownership of the RTC hardware.
-     * While UEFI can use libfdt to disable the RTC device node in the DTB that
-     * it passes to the OS, it cannot modify AML. Therefore, we won't generate
-     * the RTC ACPI device at all when using UEFI.
-     */
     scope = aml_scope("\\_SB");
     acpi_dsdt_add_cpus(scope, vms);
     acpi_dsdt_add_uart(scope, &memmap[VIRT_UART0],
@@ -1227,6 +1464,20 @@ build_dsdt(GArray *table_data, BIOSLinker *linker, VirtMachineState *vms)
     }
     if (vmc->acpi_expose_flash) {
         acpi_dsdt_add_flash(scope, &memmap[VIRT_FLASH]);
+    }
+
+    /*
+     * When booting the VM with UEFI, UEFI takes ownership of the RTC hardware.
+     * While UEFI can use libfdt to disable the RTC device node in the DTB that
+     * it passes to the OS, it cannot modify AML. Therefore, we won't generate
+     * an ACPI device for the PL031 RTC itself. Instead, its get/set real time
+     * functionality is exposed via an ACPI Time and Alarm Device, whose AML
+     * methods only perform single 32-bit accesses to the RTC data and load
+     * registers, and so they cannot interfere with the firmware's use of the
+     * RTC.
+     */
+    if (!vmc->no_acpi_tad) {
+        acpi_dsdt_add_tad(scope, &memmap[VIRT_RTC]);
     }
     fw_cfg_acpi_dsdt_add(scope, &memmap[VIRT_FW_CFG]);
     virtio_acpi_dsdt_add(scope, memmap[VIRT_MMIO].base, memmap[VIRT_MMIO].size,

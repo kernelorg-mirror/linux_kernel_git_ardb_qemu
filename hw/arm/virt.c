@@ -4448,8 +4448,11 @@ DEFINE_VIRT_MACHINE_AS_LATEST(11, 2)
 
 static void virt_machine_11_1_options(MachineClass *mc)
 {
+    VirtMachineClass *vmc = VIRT_MACHINE_CLASS(OBJECT_CLASS(mc));
+
     virt_machine_11_2_options(mc);
     compat_props_add(mc->compat_props, hw_compat_11_1, hw_compat_11_1_len);
+    vmc->no_acpi_tad = true;
 }
 DEFINE_VIRT_MACHINE(11, 1)
 
