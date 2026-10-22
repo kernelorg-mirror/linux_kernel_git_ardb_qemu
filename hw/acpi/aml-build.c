@@ -762,6 +762,28 @@ Aml *aml_subtract(Aml *arg1, Aml *arg2, Aml *dst)
     return build_opcode_2arg_dst(0x74 /* SubtractOp */, arg1, arg2, dst);
 }
 
+/* ACPI 1.0b: 16.2.5.4 Type 2 Opcodes Encoding: DefMultiply */
+Aml *aml_multiply(Aml *arg1, Aml *arg2, Aml *dst)
+{
+    return build_opcode_2arg_dst(0x77 /* MultiplyOp */, arg1, arg2, dst);
+}
+
+/*
+ * ACPI 1.0b: 16.2.5.4 Type 2 Opcodes Encoding: DefDivide
+ * @remainder and @quotient are optional targets, set to NULL if not required.
+ */
+Aml *aml_divide(Aml *dividend, Aml *divisor, Aml *remainder, Aml *quotient)
+{
+    Aml *var = build_opcode_2arg_dst(0x78 /* DivideOp */, dividend, divisor,
+                                     remainder);
+    if (quotient) {
+        aml_append(var, quotient);
+    } else {
+        build_append_byte(var->buf, 0x00 /* NullNameOp */);
+    }
+    return var;
+}
+
 /* ACPI 1.0b: 16.2.5.4 Type 2 Opcodes Encoding: DefIncrement */
 Aml *aml_increment(Aml *arg)
 {
@@ -1286,6 +1308,20 @@ Aml *aml_create_field(Aml *srcbuf, Aml *bit_index, Aml *num_bits,
     aml_append(var, num_bits);
     build_append_namestring(var->buf, "%s", name);
     return var;
+}
+
+/* ACPI 1.0b: 16.2.5.2 Named Objects Encoding: DefCreateByteField */
+Aml *aml_create_byte_field(Aml *srcbuf, Aml *index, const char *name)
+{
+    return create_field_common(0x8C /* CreateByteFieldOp */,
+                               srcbuf, index, name);
+}
+
+/* ACPI 1.0b: 16.2.5.2 Named Objects Encoding: DefCreateWordField */
+Aml *aml_create_word_field(Aml *srcbuf, Aml *index, const char *name)
+{
+    return create_field_common(0x8B /* CreateWordFieldOp */,
+                               srcbuf, index, name);
 }
 
 /* ACPI 1.0b: 16.2.5.2 Named Objects Encoding: DefCreateDWordField */

@@ -311,6 +311,8 @@ Aml *aml_shiftright(Aml *arg1, Aml *count, Aml *dst);
 Aml *aml_lless(Aml *arg1, Aml *arg2);
 Aml *aml_add(Aml *arg1, Aml *arg2, Aml *dst);
 Aml *aml_subtract(Aml *arg1, Aml *arg2, Aml *dst);
+Aml *aml_multiply(Aml *arg1, Aml *arg2, Aml *dst);
+Aml *aml_divide(Aml *dividend, Aml *divisor, Aml *remainder, Aml *quotient);
 Aml *aml_increment(Aml *arg);
 Aml *aml_decrement(Aml *arg);
 Aml *aml_index(Aml *arg1, Aml *idx);
@@ -406,6 +408,8 @@ Aml *aml_release(Aml *mutex);
 Aml *aml_alias(const char *source_object, const char *alias_object);
 Aml *aml_create_field(Aml *srcbuf, Aml *bit_index, Aml *num_bits,
                       const char *name);
+Aml *aml_create_byte_field(Aml *srcbuf, Aml *index, const char *name);
+Aml *aml_create_word_field(Aml *srcbuf, Aml *index, const char *name);
 Aml *aml_create_dword_field(Aml *srcbuf, Aml *index, const char *name);
 Aml *aml_create_qword_field(Aml *srcbuf, Aml *index, const char *name);
 Aml *aml_varpackage(uint32_t num_elements);
